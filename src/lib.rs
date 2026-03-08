@@ -158,7 +158,10 @@ impl TrashCompactor {
     /// Process an assistant response message to extract priority and update internal mappings.
     /// This is a mutating/side-effect function that stores the mapping for future compaction.
     /// The caller is responsible for stripping priority markers from content before display.
-    pub fn process_response_message(&mut self, message: &Message) {
+    ///
+    /// When an assistant message has a priority, all previous non-system messages in the
+    /// conversation that do not already have a mapping will inherit that same priority.
+    pub fn process_response_message(&mut self, message: &Message, conversation: &[Message]) {
         if message.role != "assistant" {
             return;
         }
@@ -188,7 +191,26 @@ impl TrashCompactor {
 
         self.mappings.insert(out_message.clone(), mapping);
 
-        println!("{:#?}", self);
+        // Propagate priority to previous non-system messages that don't have a mapping.
+        // If assistant message is not present in the provided slice (normal runtime flow),
+        // treat all provided messages as prior messages.
+        let previous_messages = conversation
+            .iter()
+            .position(|m| m.role == message.role && m.content == message.content)
+            .map(|position| &conversation[..position])
+            .unwrap_or(conversation);
+
+        for msg in previous_messages {
+            // Skip system messages and messages that already have a mapping
+            if msg.role != "system" && !self.mappings.contains_key(msg) {
+                let propagated_mapping = MessageMapping {
+                    new_content: None,
+                    priority,
+                    skip_me: false,
+                };
+                self.mappings.insert(msg.clone(), propagated_mapping);
+            }
+        }
     }
 
     /// Strip priority marker strings from content text.
@@ -272,7 +294,35 @@ impl TrashCompactor {
             .map(|m| m.priority)
             .unwrap_or(MessagePriority::Medium)
     }
+}
 
+/// Calculate preservation value score for a message.
+/// Higher score = more likely to be preserved intact (chosen as survivor).
+///
+/// - recency: position / (total - 1), clamped to [0.0, 1.0]
+///   (0.0 = oldest non-system message, 1.0 = newest)
+/// - brevity: 1.0 / (1.0 + token_count as f64 / 500.0)
+///   (approaches 0 for very long messages, 1.0 for empty)
+///
+/// score = RECENCY_WEIGHT * recency + LENGTH_WEIGHT * brevity
+///
+/// Default weights: RECENCY_WEIGHT = 0.6, LENGTH_WEIGHT = 0.4
+pub fn message_value_score(position: usize, total_messages: usize, token_count: usize) -> f64 {
+    const RECENCY_WEIGHT: f64 = 0.6;
+    const LENGTH_WEIGHT: f64 = 0.4;
+
+    let recency = if total_messages <= 1 {
+        1.0
+    } else {
+        position as f64 / (total_messages - 1) as f64
+    };
+
+    let brevity = 1.0 / (1.0 + token_count as f64 / 500.0);
+
+    RECENCY_WEIGHT * recency + LENGTH_WEIGHT * brevity
+}
+
+impl TrashCompactor {
     /// Check if message is skipped.
     fn is_skipped(&self, message: &Message) -> bool {
         self.mappings
@@ -373,14 +423,15 @@ impl TrashCompactor {
 
     /// Phase 2: Compact long medium-priority messages (top quartile).
     fn plan_phase2(&self, messages: &[Message]) -> Option<CompactionPlan> {
-        // Gather non-system, non-skipped medium messages with their token counts
-        let medium_messages: Vec<(Message, usize)> = messages
+        // Gather non-system, non-skipped medium messages with their source indices and token counts
+        let medium_messages: Vec<(usize, Message, usize)> = messages
             .iter()
-            .filter(|m| m.role != "system" && !self.is_skipped(m))
-            .filter(|m| self.get_priority(m) == MessagePriority::Medium)
-            .map(|m| {
+            .enumerate()
+            .filter(|(_, m)| m.role != "system" && !self.is_skipped(m))
+            .filter(|(_, m)| self.get_priority(m) == MessagePriority::Medium)
+            .map(|(index, m)| {
                 let tokens = count_tokens(&self.get_effective_content(m));
-                (m.clone(), tokens)
+                (index, m.clone(), tokens)
             })
             .collect();
 
@@ -391,35 +442,36 @@ impl TrashCompactor {
 
         // Sort by token count ascending
         let mut sorted = medium_messages.clone();
-        sorted.sort_by_key(|(_, tokens)| *tokens);
+        sorted.sort_by_key(|(_, _, tokens)| *tokens);
 
         // Calculate P75 index
         let n = sorted.len();
         let p75_index = ((0.75 * n as f64).ceil() as usize).saturating_sub(1);
-        let p75_threshold = sorted[p75_index].1;
+        let p75_threshold = sorted[p75_index].2;
 
         // Select messages with token count >= P75
-        let long_medium: Vec<Message> = medium_messages
+        let long_medium: Vec<(usize, Message, usize)> = medium_messages
             .into_iter()
-            .filter(|(_, tokens)| *tokens >= p75_threshold)
-            .map(|(m, _)| m)
+            .filter(|(_, _, tokens)| *tokens >= p75_threshold)
             .collect();
 
         if long_medium.is_empty() {
             return self.plan_phase3(messages);
         }
 
-        // Find survivor (first in conversation order)
-        let survivor_index = messages
+        // Find survivor (highest value score)
+        let survivor_index = long_medium
             .iter()
-            .position(|m| long_medium.contains(m))
+            .map(|(pos, _, tokens)| (*pos, message_value_score(*pos, messages.len(), *tokens)))
+            .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+            .map(|(pos, _)| pos)
             .unwrap_or(0);
 
         // Build combined text with separators
         let combined_text = long_medium
             .iter()
             .enumerate()
-            .map(|(i, m)| {
+            .map(|(i, (_, m, _))| {
                 format!(
                     "\n---\n[Message {} ({})]\n{}",
                     i,
@@ -429,9 +481,11 @@ impl TrashCompactor {
             })
             .collect::<String>();
 
+        let messages_to_compact = long_medium.into_iter().map(|(_, m, _)| m).collect();
+
         Some(CompactionPlan {
             phase: CompactionPhase::Phase2MediumLong,
-            messages_to_compact: long_medium,
+            messages_to_compact,
             combined_text,
             survivor_index,
         })
@@ -439,28 +493,34 @@ impl TrashCompactor {
 
     /// Phase 3: Compact all medium-priority messages together.
     fn plan_phase3(&self, messages: &[Message]) -> Option<CompactionPlan> {
-        let medium_messages: Vec<Message> = messages
+        let medium_messages: Vec<(usize, Message, usize)> = messages
             .iter()
-            .filter(|m| m.role != "system" && !self.is_skipped(m))
-            .filter(|m| self.get_priority(m) == MessagePriority::Medium)
-            .cloned()
+            .enumerate()
+            .filter(|(_, m)| m.role != "system" && !self.is_skipped(m))
+            .filter(|(_, m)| self.get_priority(m) == MessagePriority::Medium)
+            .map(|(index, m)| {
+                let tokens = count_tokens(&self.get_effective_content(m));
+                (index, m.clone(), tokens)
+            })
             .collect();
 
         if medium_messages.is_empty() {
             return self.plan_phase4(messages);
         }
 
-        // Find survivor (first in conversation order)
-        let survivor_index = messages
+        // Find survivor (highest value score)
+        let survivor_index = medium_messages
             .iter()
-            .position(|m| medium_messages.contains(m))
+            .map(|(pos, _, tokens)| (*pos, message_value_score(*pos, messages.len(), *tokens)))
+            .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+            .map(|(pos, _)| pos)
             .unwrap_or(0);
 
         // Build combined text
         let combined_text = medium_messages
             .iter()
             .enumerate()
-            .map(|(i, m)| {
+            .map(|(i, (_, m, _))| {
                 format!(
                     "\n---\n[Message {} ({})]\n{}",
                     i,
@@ -470,9 +530,11 @@ impl TrashCompactor {
             })
             .collect::<String>();
 
+        let messages_to_compact = medium_messages.into_iter().map(|(_, m, _)| m).collect();
+
         Some(CompactionPlan {
             phase: CompactionPhase::Phase3MediumAll,
-            messages_to_compact: medium_messages,
+            messages_to_compact,
             combined_text,
             survivor_index,
         })
@@ -480,28 +542,34 @@ impl TrashCompactor {
 
     /// Phase 4: Compact high-priority messages (including Phase 3 survivor if promoted).
     fn plan_phase4(&self, messages: &[Message]) -> Option<CompactionPlan> {
-        let high_messages: Vec<Message> = messages
+        let high_messages: Vec<(usize, Message, usize)> = messages
             .iter()
-            .filter(|m| m.role != "system" && !self.is_skipped(m))
-            .filter(|m| self.get_priority(m) == MessagePriority::High)
-            .cloned()
+            .enumerate()
+            .filter(|(_, m)| m.role != "system" && !self.is_skipped(m))
+            .filter(|(_, m)| self.get_priority(m) == MessagePriority::High)
+            .map(|(index, m)| {
+                let tokens = count_tokens(&self.get_effective_content(m));
+                (index, m.clone(), tokens)
+            })
             .collect();
 
         if high_messages.is_empty() {
             return None;
         }
 
-        // Find survivor (first in conversation order)
-        let survivor_index = messages
+        // Find survivor (highest value score)
+        let survivor_index = high_messages
             .iter()
-            .position(|m| high_messages.contains(m))
+            .map(|(pos, _, tokens)| (*pos, message_value_score(*pos, messages.len(), *tokens)))
+            .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+            .map(|(pos, _)| pos)
             .unwrap_or(0);
 
         // Build combined text
         let combined_text = high_messages
             .iter()
             .enumerate()
-            .map(|(i, m)| {
+            .map(|(i, (_, m, _))| {
                 format!(
                     "\n---\n[Message {} ({})]\n{}",
                     i,
@@ -511,9 +579,11 @@ impl TrashCompactor {
             })
             .collect::<String>();
 
+        let messages_to_compact = high_messages.into_iter().map(|(_, m, _)| m).collect();
+
         Some(CompactionPlan {
             phase: CompactionPhase::Phase4High,
-            messages_to_compact: high_messages,
+            messages_to_compact,
             combined_text,
             survivor_index,
         })
@@ -1014,7 +1084,8 @@ mod tests {
             role: "assistant".to_string(),
             content: "Response text $$PRIORITY:MEDIUM$$".to_string(),
         };
-        compactor.process_response_message(&message);
+        // Pass empty conversation since we're just testing the basic mapping creation
+        compactor.process_response_message(&message, &[]);
 
         // Verify mapping was created (stripped content as key)
         let stripped_message = Message {
@@ -1036,7 +1107,7 @@ mod tests {
             role: "user".to_string(),
             content: "User text".to_string(),
         };
-        compactor.process_response_message(&user_message);
+        compactor.process_response_message(&user_message, &[]);
 
         // User message should not be in mappings
         let user_key = Message {
@@ -1044,5 +1115,477 @@ mod tests {
             content: "User text".to_string(),
         };
         assert!(!compactor.mappings.contains_key(&user_key));
+    }
+
+    #[test]
+    fn test_propagate_priority_to_previous_user_messages() {
+        let mut compactor = TrashCompactor::new();
+
+        // Create a conversation with user messages followed by assistant
+        let conversation = vec![
+            Message {
+                role: "user".to_string(),
+                content: "First user message".to_string(),
+            },
+            Message {
+                role: "user".to_string(),
+                content: "Second user message".to_string(),
+            },
+            Message {
+                role: "assistant".to_string(),
+                content: "Assistant response $$PRIORITY:HIGH$$".to_string(),
+            },
+        ];
+
+        let assistant_msg = &conversation[2];
+        compactor.process_response_message(assistant_msg, &conversation);
+
+        // Both user messages should now have High priority
+        let first_mapping = compactor.mappings.get(&conversation[0]).unwrap();
+        assert_eq!(first_mapping.priority, MessagePriority::High);
+        assert_eq!(first_mapping.new_content, None);
+        assert!(!first_mapping.skip_me);
+
+        let second_mapping = compactor.mappings.get(&conversation[1]).unwrap();
+        assert_eq!(second_mapping.priority, MessagePriority::High);
+        assert_eq!(second_mapping.new_content, None);
+    }
+
+    #[test]
+    fn test_propagate_priority_skips_system_messages() {
+        let mut compactor = TrashCompactor::new();
+
+        let conversation = vec![
+            Message {
+                role: "system".to_string(),
+                content: "System prompt".to_string(),
+            },
+            Message {
+                role: "user".to_string(),
+                content: "User message".to_string(),
+            },
+            Message {
+                role: "assistant".to_string(),
+                content: "Assistant response $$PRIORITY:LOW$$".to_string(),
+            },
+        ];
+
+        let assistant_msg = &conversation[2];
+        compactor.process_response_message(assistant_msg, &conversation);
+
+        // System message should NOT have a mapping
+        assert!(!compactor.mappings.contains_key(&conversation[0]));
+
+        // User message should have Low priority
+        let user_mapping = compactor.mappings.get(&conversation[1]).unwrap();
+        assert_eq!(user_mapping.priority, MessagePriority::Low);
+    }
+
+    #[test]
+    fn test_propagate_priority_skips_already_mapped_messages() {
+        let mut compactor = TrashCompactor::new();
+
+        // Pre-create a mapping for the first user message with High priority
+        let user_msg = Message {
+            role: "user".to_string(),
+            content: "User message".to_string(),
+        };
+        compactor.mappings.insert(
+            user_msg.clone(),
+            MessageMapping {
+                new_content: None,
+                priority: MessagePriority::High,
+                skip_me: false,
+            },
+        );
+
+        let conversation = vec![
+            user_msg,
+            Message {
+                role: "assistant".to_string(),
+                content: "Assistant response $$PRIORITY:LOW$$".to_string(),
+            },
+        ];
+
+        let assistant_msg = &conversation[1];
+        compactor.process_response_message(assistant_msg, &conversation);
+
+        // User message should retain its original High priority (not overwritten)
+        let user_mapping = compactor.mappings.get(&conversation[0]).unwrap();
+        assert_eq!(user_mapping.priority, MessagePriority::High);
+    }
+
+    #[test]
+    fn test_propagate_priority_to_tool_messages() {
+        let mut compactor = TrashCompactor::new();
+
+        let conversation = vec![
+            Message {
+                role: "user".to_string(),
+                content: "User message".to_string(),
+            },
+            Message {
+                role: "tool".to_string(),
+                content: "Tool response".to_string(),
+            },
+            Message {
+                role: "assistant".to_string(),
+                content: "Assistant response $$PRIORITY:HIGH$$".to_string(),
+            },
+        ];
+
+        let assistant_msg = &conversation[2];
+        compactor.process_response_message(assistant_msg, &conversation);
+
+        // Both user and tool messages should have High priority
+        let user_mapping = compactor.mappings.get(&conversation[0]).unwrap();
+        assert_eq!(user_mapping.priority, MessagePriority::High);
+
+        let tool_mapping = compactor.mappings.get(&conversation[1]).unwrap();
+        assert_eq!(tool_mapping.priority, MessagePriority::High);
+    }
+
+    #[test]
+    fn test_propagate_priority_only_before_assistant() {
+        let mut compactor = TrashCompactor::new();
+
+        let conversation = vec![
+            Message {
+                role: "assistant".to_string(),
+                content: "First assistant $$PRIORITY:HIGH$$".to_string(),
+            },
+            Message {
+                role: "user".to_string(),
+                content: "User message after".to_string(),
+            },
+        ];
+
+        let first_assistant = &conversation[0];
+        compactor.process_response_message(first_assistant, &conversation);
+
+        // User message comes AFTER the assistant, so it should NOT have a mapping
+        assert!(!compactor.mappings.contains_key(&conversation[1]));
+    }
+
+    #[test]
+    fn test_propagate_priority_default_medium_when_no_marker() {
+        let mut compactor = TrashCompactor::new();
+
+        let conversation = vec![
+            Message {
+                role: "user".to_string(),
+                content: "User message".to_string(),
+            },
+            Message {
+                role: "assistant".to_string(),
+                content: "Assistant response without marker".to_string(),
+            },
+        ];
+
+        let assistant_msg = &conversation[1];
+        compactor.process_response_message(assistant_msg, &conversation);
+
+        // User message should get default Medium priority
+        let user_mapping = compactor.mappings.get(&conversation[0]).unwrap();
+        assert_eq!(user_mapping.priority, MessagePriority::Medium);
+    }
+
+    #[test]
+    fn test_propagate_priority_empty_conversation() {
+        let mut compactor = TrashCompactor::new();
+
+        let message = Message {
+            role: "assistant".to_string(),
+            content: "Response $$PRIORITY:HIGH$$".to_string(),
+        };
+
+        // Should not panic with empty conversation
+        compactor.process_response_message(&message, &[]);
+
+        // Verify the assistant mapping was still created
+        let stripped_message = Message {
+            role: "assistant".to_string(),
+            content: "Response".to_string(),
+        };
+        assert!(compactor.mappings.contains_key(&stripped_message));
+    }
+
+    #[test]
+    fn test_propagate_priority_when_assistant_not_in_conversation_slice() {
+        let mut compactor = TrashCompactor::new();
+
+        // Runtime call sites pass prior/incoming messages only (no assistant yet).
+        let conversation = vec![
+            Message {
+                role: "system".to_string(),
+                content: "System prompt".to_string(),
+            },
+            Message {
+                role: "user".to_string(),
+                content: "User message".to_string(),
+            },
+            Message {
+                role: "tool".to_string(),
+                content: "Tool result".to_string(),
+            },
+        ];
+
+        let assistant = Message {
+            role: "assistant".to_string(),
+            content: "Assistant response $$PRIORITY:HIGH$$".to_string(),
+        };
+
+        compactor.process_response_message(&assistant, &conversation);
+
+        // System message should still be skipped.
+        assert!(!compactor.mappings.contains_key(&conversation[0]));
+
+        // Non-system prior messages should inherit the assistant priority.
+        let user_mapping = compactor.mappings.get(&conversation[1]).unwrap();
+        assert_eq!(user_mapping.priority, MessagePriority::High);
+        assert_eq!(user_mapping.new_content, None);
+
+        let tool_mapping = compactor.mappings.get(&conversation[2]).unwrap();
+        assert_eq!(tool_mapping.priority, MessagePriority::High);
+        assert_eq!(tool_mapping.new_content, None);
+    }
+
+    // ========================================================================
+    // Value Score Tests
+    // ========================================================================
+
+    #[test]
+    fn test_message_value_score_newer_scores_higher() {
+        // Two messages at positions 0 and 9 (total=10), same token count
+        let score_old = message_value_score(0, 10, 100);
+        let score_new = message_value_score(9, 10, 100);
+        assert!(score_new > score_old, "Newer message should score higher");
+    }
+
+    #[test]
+    fn test_message_value_score_shorter_scores_higher() {
+        // Two messages at same position, one with 50 tokens and one with 2000 tokens
+        let score_short = message_value_score(5, 10, 50);
+        let score_long = message_value_score(5, 10, 2000);
+        assert!(
+            score_short > score_long,
+            "Shorter message should score higher"
+        );
+    }
+
+    #[test]
+    fn test_message_value_score_combined() {
+        // Newer+shorter beats older+longer
+        let score_old_long = message_value_score(0, 10, 2000);
+        let score_new_short = message_value_score(9, 10, 50);
+        assert!(
+            score_new_short > score_old_long,
+            "Newer+shorter should beat older+longer"
+        );
+
+        // Test the crossover: very old but very short vs very new but very long
+        let score_very_old_short = message_value_score(0, 10, 10);
+        let score_very_new_long = message_value_score(9, 10, 5000);
+
+        // With 60/40 weighting, recency has more weight
+        // recency: 0 vs 1, brevity: ~1.0 vs ~0.09
+        // score_old = 0.6 * 0.0 + 0.4 * 0.98 ≈ 0.39
+        // score_new = 0.6 * 1.0 + 0.4 * 0.09 ≈ 0.64
+        assert!(
+            score_very_new_long > score_very_old_short,
+            "With 60/40 weighting, very new+long should beat very old+short"
+        );
+    }
+
+    #[test]
+    fn test_message_value_score_single_message() {
+        // With total_messages=1, recency should be 1.0 (not divide-by-zero)
+        let score = message_value_score(0, 1, 100);
+        assert!(score.is_finite(), "Score should be finite");
+        assert!(score > 0.0, "Score should be positive");
+    }
+
+    #[test]
+    fn test_message_value_score_zero_tokens() {
+        // Token count of 0 should give brevity of 1.0
+        let score = message_value_score(5, 10, 0);
+        // recency = 5/9 ≈ 0.556, brevity = 1.0
+        // score = 0.6 * 0.556 + 0.4 * 1.0 ≈ 0.733
+        assert!(score > 0.7, "Zero tokens should give high brevity score");
+    }
+
+    #[test]
+    fn test_phase2_survivor_prefers_newer_shorter() {
+        let mut compactor = TrashCompactor::new();
+
+        // Create 4 medium messages where the Phase 2 long-message candidates are
+        // indices 2 and 3, and index 3 is newer + shorter than index 2.
+        let messages = vec![
+            Message {
+                role: "user".to_string(),
+                content: "a ".repeat(20),
+            },
+            Message {
+                role: "assistant".to_string(),
+                content: "b ".repeat(40),
+            },
+            Message {
+                role: "user".to_string(),
+                content: "c ".repeat(700), // Long candidate
+            },
+            Message {
+                role: "assistant".to_string(),
+                content: "d ".repeat(600), // Newer + slightly shorter long candidate
+            },
+        ];
+
+        // All medium priority
+        for msg in &messages {
+            compactor.mappings.insert(
+                msg.clone(),
+                MessageMapping {
+                    new_content: None,
+                    priority: MessagePriority::Medium,
+                    skip_me: false,
+                },
+            );
+        }
+
+        let plan = compactor.plan_phase2(&messages).unwrap();
+
+        // The newest message (index 3) should be the survivor because it's
+        // both newer and shorter than the other candidates
+        assert_eq!(
+            plan.survivor_index, 3,
+            "Newest/shortest message should be survivor"
+        );
+    }
+
+    #[test]
+    fn test_phase3_survivor_prefers_newer() {
+        let mut compactor = TrashCompactor::new();
+
+        // Create 3 medium messages of equal length at different positions.
+        // Messages at indices 0 and 2 are exact duplicates (same role + content)
+        // to verify survivor scoring uses true source index, not equality lookup.
+        let messages = vec![
+            Message {
+                role: "user".to_string(),
+                content: "test content".to_string(),
+            },
+            Message {
+                role: "assistant".to_string(),
+                content: "test content".to_string(),
+            },
+            Message {
+                role: "user".to_string(),
+                content: "test content".to_string(),
+            },
+        ];
+
+        // All medium priority
+        for msg in &messages {
+            compactor.mappings.insert(
+                msg.clone(),
+                MessageMapping {
+                    new_content: None,
+                    priority: MessagePriority::Medium,
+                    skip_me: false,
+                },
+            );
+        }
+
+        let plan = compactor.plan_phase3(&messages).unwrap();
+
+        // The last (newest) message should be the survivor
+        assert_eq!(plan.survivor_index, 2, "Newest message should be survivor");
+    }
+
+    #[test]
+    fn test_phase4_survivor_prefers_newer_shorter() {
+        let mut compactor = TrashCompactor::new();
+
+        // Create 3 high-priority messages
+        let messages = vec![
+            Message {
+                role: "user".to_string(),
+                content: "x".repeat(1000), // Oldest, longest
+            },
+            Message {
+                role: "assistant".to_string(),
+                content: "y".repeat(500),
+            },
+            Message {
+                role: "user".to_string(),
+                content: "z".repeat(100), // Newest, shortest
+            },
+        ];
+
+        // All high priority
+        for msg in &messages {
+            compactor.mappings.insert(
+                msg.clone(),
+                MessageMapping {
+                    new_content: None,
+                    priority: MessagePriority::High,
+                    skip_me: false,
+                },
+            );
+        }
+
+        let plan = compactor.plan_phase4(&messages).unwrap();
+
+        // The newest message (index 2) should be the survivor
+        assert_eq!(
+            plan.survivor_index, 2,
+            "Newest/shortest message should be survivor"
+        );
+    }
+
+    #[test]
+    fn test_survivor_selection_old_behavior_changed() {
+        let mut compactor = TrashCompactor::new();
+
+        // Create messages where the first message is the longest
+        let messages = vec![
+            Message {
+                role: "user".to_string(),
+                content: "a".repeat(2000), // Oldest, longest - would have been survivor before
+            },
+            Message {
+                role: "assistant".to_string(),
+                content: "b".repeat(100),
+            },
+            Message {
+                role: "user".to_string(),
+                content: "c".repeat(100),
+            },
+            Message {
+                role: "assistant".to_string(),
+                content: "d".repeat(100), // Newest, shorter
+            },
+        ];
+
+        // All medium priority
+        for msg in &messages {
+            compactor.mappings.insert(
+                msg.clone(),
+                MessageMapping {
+                    new_content: None,
+                    priority: MessagePriority::Medium,
+                    skip_me: false,
+                },
+            );
+        }
+
+        let plan = compactor.plan_phase3(&messages).unwrap();
+
+        // The first message should NOT be chosen as survivor
+        assert_ne!(
+            plan.survivor_index, 0,
+            "First/longest message should NOT be survivor"
+        );
+        // Instead, the newest message should be survivor
+        assert_eq!(plan.survivor_index, 3, "Newest message should be survivor");
     }
 }

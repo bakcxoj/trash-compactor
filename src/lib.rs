@@ -228,6 +228,42 @@ impl TrashCompactor {
         no_p_content.to_string()
     }
 
+    /// Remove all complete priority marker strings from content text.
+    /// Used for user-visible content sanitization (including streaming output).
+    pub fn remove_all_priority_markers(content: &str) -> String {
+        content
+            .replace(PRIORITY_HIGH, "")
+            .replace(PRIORITY_MEDIUM, "")
+            .replace(PRIORITY_LOW, "")
+    }
+
+    /// Returns the length of the longest suffix of `content` that is a proper
+    /// prefix of any priority marker constant. Returns 0 if no partial match.
+    /// This is used during streaming to hold back content that might be the
+    /// start of a marker split across chunks.
+    pub fn partial_marker_suffix_len(content: &str) -> usize {
+        let markers = [PRIORITY_HIGH, PRIORITY_MEDIUM, PRIORITY_LOW];
+
+        // A full marker suffix is not a partial overlap.
+        if markers.iter().any(|marker| content.ends_with(marker)) {
+            return 0;
+        }
+
+        let mut max_overlap = 0;
+        for marker in &markers {
+            let marker_bytes = marker.as_bytes();
+            // Check prefixes of length 1..marker_len (exclusive of full marker,
+            // since full markers are handled by strip_priority_markers)
+            for prefix_len in (1..marker_bytes.len()).rev() {
+                if content.as_bytes().ends_with(&marker_bytes[..prefix_len]) {
+                    max_overlap = max_overlap.max(prefix_len);
+                    break; // Found longest prefix match for this marker
+                }
+            }
+        }
+        max_overlap
+    }
+
     pub fn run_mappings(&mut self, _model_name: &str, messages: impl IntoIterator<Item = Message>) {
         for message in messages {
             if !self.mappings.contains_key(&message) && message.role == "system" {
@@ -1076,6 +1112,94 @@ mod tests {
     }
 
     #[test]
+    fn test_remove_all_priority_markers() {
+        let content = "Hello $$PRIORITY:HIGH$$ world $$PRIORITY:LOW$$!";
+        assert_eq!(
+            TrashCompactor::remove_all_priority_markers(content),
+            "Hello  world !"
+        );
+
+        let content = "$$PRIORITY:MEDIUM$$";
+        assert_eq!(TrashCompactor::remove_all_priority_markers(content), "");
+    }
+
+    #[test]
+    fn test_partial_marker_suffix_len_no_match() {
+        assert_eq!(TrashCompactor::partial_marker_suffix_len("Hello world"), 0);
+    }
+
+    #[test]
+    fn test_partial_marker_suffix_len_dollar_sign() {
+        // "$" is a 1-byte prefix of "$$PRIORITY:..."
+        assert_eq!(TrashCompactor::partial_marker_suffix_len("Hello $"), 1);
+    }
+
+    #[test]
+    fn test_partial_marker_suffix_len_double_dollar() {
+        // "$$" is a 2-byte prefix
+        assert_eq!(TrashCompactor::partial_marker_suffix_len("Hello $$"), 2);
+    }
+
+    #[test]
+    fn test_partial_marker_suffix_len_partial_priority() {
+        // "$$PRIORITY:" is the 11-byte common prefix
+        assert_eq!(
+            TrashCompactor::partial_marker_suffix_len("Hello $$PRIORITY:"),
+            11
+        );
+    }
+
+    #[test]
+    fn test_partial_marker_suffix_len_almost_complete() {
+        // "$$PRIORITY:HIG" is 14 bytes (HIGH$$ minus "H$$")
+        assert_eq!(
+            TrashCompactor::partial_marker_suffix_len("Hello $$PRIORITY:HIG"),
+            14
+        );
+    }
+
+    #[test]
+    fn test_partial_marker_suffix_len_full_marker_returns_zero() {
+        // Full marker is NOT a proper prefix; handled by strip
+        assert_eq!(
+            TrashCompactor::partial_marker_suffix_len("Hello $$PRIORITY:HIGH$$"),
+            0
+        );
+    }
+
+    #[test]
+    fn test_partial_marker_suffix_len_medium_partial() {
+        // "$$PRIORITY:MED" is 14 bytes
+        assert_eq!(
+            TrashCompactor::partial_marker_suffix_len("Hello $$PRIORITY:MED"),
+            14
+        );
+    }
+
+    #[test]
+    fn test_partial_marker_suffix_len_low_partial() {
+        // "$$PRIORITY:LO" is 13 bytes
+        assert_eq!(
+            TrashCompactor::partial_marker_suffix_len("Hello $$PRIORITY:LO"),
+            13
+        );
+    }
+
+    #[test]
+    fn test_partial_marker_suffix_len_empty() {
+        assert_eq!(TrashCompactor::partial_marker_suffix_len(""), 0);
+    }
+
+    #[test]
+    fn test_partial_marker_suffix_len_just_marker_prefix() {
+        // "$$PRIORITY:HIGH$" is 16 bytes (one "$" short of complete)
+        assert_eq!(
+            TrashCompactor::partial_marker_suffix_len("$$PRIORITY:HIGH$"),
+            16
+        );
+    }
+
+    #[test]
     fn test_process_response_message_no_return() {
         let mut compactor = TrashCompactor::new();
 
@@ -1587,5 +1711,213 @@ mod tests {
         );
         // Instead, the newest message should be survivor
         assert_eq!(plan.survivor_index, 3, "Newest message should be survivor");
+    }
+
+    // ========================================================================
+    // Streaming Marker Leak Tests
+    // ========================================================================
+
+    #[test]
+    fn test_streaming_marker_not_split_across_chunks() {
+        // Simulate 3 chunks: "Hello ", "world$$PRIORITY:HIGH$$", done
+        let chunks = ["Hello ", "world$$PRIORITY:HIGH$$"];
+        let mut accumulated = String::new();
+        let mut emitted_len = 0usize;
+        let mut output = String::new();
+
+        for (i, chunk) in chunks.iter().enumerate() {
+            accumulated.push_str(chunk);
+            let stripped = TrashCompactor::remove_all_priority_markers(&accumulated);
+            let is_done = i == chunks.len() - 1;
+            let holdback = if is_done {
+                0
+            } else {
+                TrashCompactor::partial_marker_suffix_len(&accumulated)
+            };
+            let safe_len = stripped.len().saturating_sub(holdback);
+            if safe_len > emitted_len {
+                output.push_str(&stripped[emitted_len..safe_len]);
+                emitted_len = safe_len;
+            }
+        }
+
+        assert_eq!(output, "Hello world");
+    }
+
+    #[test]
+    fn test_streaming_marker_split_across_two_chunks() {
+        // Simulate: "Hello $$PRIORITY:", "HIGH$$", done
+        let chunks = ["Hello $$PRIORITY:", "HIGH$$"];
+        let mut accumulated = String::new();
+        let mut emitted_len = 0usize;
+        let mut output = String::new();
+
+        for (i, chunk) in chunks.iter().enumerate() {
+            accumulated.push_str(chunk);
+            let stripped = TrashCompactor::remove_all_priority_markers(&accumulated);
+            let is_done = i == chunks.len() - 1;
+            let holdback = if is_done {
+                0
+            } else {
+                TrashCompactor::partial_marker_suffix_len(&accumulated)
+            };
+            let safe_len = stripped.len().saturating_sub(holdback);
+            if safe_len > emitted_len {
+                output.push_str(&stripped[emitted_len..safe_len]);
+                emitted_len = safe_len;
+            }
+        }
+
+        assert_eq!(output, "Hello ");
+    }
+
+    #[test]
+    fn test_streaming_marker_split_at_every_byte() {
+        // For marker "$$PRIORITY:HIGH$$", split it one byte at a time appended to "Hello "
+        let marker = "$$PRIORITY:HIGH$$";
+        let prefix = "Hello ";
+
+        for split_point in 0..=marker.len() {
+            let mut chunks = vec![];
+
+            // First chunk: prefix + first part of marker
+            chunks.push(format!("{}{}", prefix, &marker[..split_point]));
+
+            // Second chunk: rest of marker
+            if split_point < marker.len() {
+                chunks.push(marker[split_point..].to_string());
+            }
+
+            let mut accumulated = String::new();
+            let mut emitted_len = 0usize;
+            let mut output = String::new();
+
+            for (i, chunk) in chunks.iter().enumerate() {
+                accumulated.push_str(chunk);
+                let stripped = TrashCompactor::remove_all_priority_markers(&accumulated);
+                let is_done = i == chunks.len() - 1;
+                let holdback = if is_done {
+                    0
+                } else {
+                    TrashCompactor::partial_marker_suffix_len(&accumulated)
+                };
+                let safe_len = stripped.len().saturating_sub(holdback);
+                if safe_len > emitted_len {
+                    output.push_str(&stripped[emitted_len..safe_len]);
+                    emitted_len = safe_len;
+                }
+            }
+
+            assert_eq!(output, "Hello ", "Failed at split point {}", split_point);
+        }
+    }
+
+    #[test]
+    fn test_streaming_no_marker_passes_through() {
+        // Simulate: "Hello ", "world", done
+        let chunks = ["Hello ", "world"];
+        let mut accumulated = String::new();
+        let mut emitted_len = 0usize;
+        let mut output = String::new();
+
+        for (i, chunk) in chunks.iter().enumerate() {
+            accumulated.push_str(chunk);
+            let stripped = TrashCompactor::remove_all_priority_markers(&accumulated);
+            let is_done = i == chunks.len() - 1;
+            let holdback = if is_done {
+                0
+            } else {
+                TrashCompactor::partial_marker_suffix_len(&accumulated)
+            };
+            let safe_len = stripped.len().saturating_sub(holdback);
+            if safe_len > emitted_len {
+                output.push_str(&stripped[emitted_len..safe_len]);
+                emitted_len = safe_len;
+            }
+        }
+
+        assert_eq!(output, "Hello world");
+    }
+
+    #[test]
+    fn test_streaming_marker_medium_split() {
+        // Simulate: "Result $$PRIORITY:MED", "IUM$$", done
+        let chunks = ["Result $$PRIORITY:MED", "IUM$$"];
+        let mut accumulated = String::new();
+        let mut emitted_len = 0usize;
+        let mut output = String::new();
+
+        for (i, chunk) in chunks.iter().enumerate() {
+            accumulated.push_str(chunk);
+            let stripped = TrashCompactor::remove_all_priority_markers(&accumulated);
+            let is_done = i == chunks.len() - 1;
+            let holdback = if is_done {
+                0
+            } else {
+                TrashCompactor::partial_marker_suffix_len(&accumulated)
+            };
+            let safe_len = stripped.len().saturating_sub(holdback);
+            if safe_len > emitted_len {
+                output.push_str(&stripped[emitted_len..safe_len]);
+                emitted_len = safe_len;
+            }
+        }
+
+        assert_eq!(output, "Result ");
+    }
+
+    #[test]
+    fn test_streaming_holdback_releases_on_false_alarm() {
+        // Simulate: "Price is $", "5.00 today", done
+        let chunks = ["Price is $", "5.00 today"];
+        let mut accumulated = String::new();
+        let mut emitted_len = 0usize;
+        let mut output = String::new();
+
+        for (i, chunk) in chunks.iter().enumerate() {
+            accumulated.push_str(chunk);
+            let stripped = TrashCompactor::remove_all_priority_markers(&accumulated);
+            let is_done = i == chunks.len() - 1;
+            let holdback = if is_done {
+                0
+            } else {
+                TrashCompactor::partial_marker_suffix_len(&accumulated)
+            };
+            let safe_len = stripped.len().saturating_sub(holdback);
+            if safe_len > emitted_len {
+                output.push_str(&stripped[emitted_len..safe_len]);
+                emitted_len = safe_len;
+            }
+        }
+
+        // The "$" was held back initially but released when it turned out not to be a marker
+        assert_eq!(output, "Price is $5.00 today");
+    }
+
+    #[test]
+    fn test_streaming_empty_chunks_no_duplicate() {
+        // Simulate: "Hello", "", "", " world", done
+        let chunks = ["Hello", "", "", " world"];
+        let mut accumulated = String::new();
+        let mut emitted_len = 0usize;
+        let mut output = String::new();
+
+        for (i, chunk) in chunks.iter().enumerate() {
+            accumulated.push_str(chunk);
+            let stripped = TrashCompactor::remove_all_priority_markers(&accumulated);
+            let is_done = i == chunks.len() - 1;
+            let holdback = if is_done {
+                0
+            } else {
+                TrashCompactor::partial_marker_suffix_len(&accumulated)
+            };
+            let safe_len = stripped.len().saturating_sub(holdback);
+            if safe_len > emitted_len {
+                output.push_str(&stripped[emitted_len..safe_len]);
+                emitted_len = safe_len;
+            }
+        }
+
+        assert_eq!(output, "Hello world");
     }
 }

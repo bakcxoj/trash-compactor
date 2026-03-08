@@ -1,11 +1,11 @@
 use axum::{
+    Json, Router,
     body::Body,
     extract::{Path, State},
     http::StatusCode,
-    response::sse::{Event, Sse},
     response::IntoResponse,
+    response::sse::{Event, Sse},
     routing::{get, post},
-    Json, Router,
 };
 use clap::Parser;
 use futures::StreamExt;
@@ -22,7 +22,11 @@ use tokio::sync::RwLock;
 // ============================================================================
 
 #[derive(Parser, Debug)]
-#[command(name = "trash-compactor", version, about = "Context-compacting Ollama proxy")]
+#[command(
+    name = "trash-compactor",
+    version,
+    about = "Context-compacting Ollama proxy"
+)]
 struct CliArgs {
     /// Path to TOML config file
     #[arg(short, long, default_value = "trash-compactor.toml")]
@@ -100,7 +104,10 @@ impl AppConfig {
                 }
             }
         } else {
-            println!("No config file found at {}, using defaults", args.config.display());
+            println!(
+                "No config file found at {}, using defaults",
+                args.config.display()
+            );
             FileConfig::default()
         };
 
@@ -337,8 +344,8 @@ fn parse_text_tool_calls(content: &str) -> Option<(Vec<Value>, String)> {
         }
 
         // Build tool call in the same shape as extract_ollama_tool_calls output
-        let arguments_str = serde_json::to_string(&Value::Object(arguments))
-            .unwrap_or_else(|_| "{}".to_string());
+        let arguments_str =
+            serde_json::to_string(&Value::Object(arguments)).unwrap_or_else(|_| "{}".to_string());
 
         let tool_call = serde_json::json!({
             "id": format!("call_text_{}", call_index),
@@ -465,7 +472,7 @@ fn normalize_tool_arguments_value(tool_name: &str, args: Value) -> Value {
     // Serialize to string, normalize, then deserialize back
     let args_str = serde_json::to_string(&args).unwrap_or_default();
     let normalized_str = normalize_tool_arguments(tool_name, &args_str);
-    
+
     serde_json::from_str(&normalized_str).unwrap_or(args)
 }
 
@@ -578,7 +585,9 @@ fn ollama_to_openai_response(
         .and_then(|d| d.as_bool())
         .unwrap_or(true);
 
-    let normalized_tool_calls = tool_calls.map(normalize_openai_tool_calls).unwrap_or_default();
+    let normalized_tool_calls = tool_calls
+        .map(normalize_openai_tool_calls)
+        .unwrap_or_default();
     let has_tool_calls = !normalized_tool_calls.is_empty();
     let finish_reason = if has_tool_calls {
         "tool_calls"
@@ -601,10 +610,7 @@ fn ollama_to_openai_response(
     }
 
     // Preserve all top-level Ollama fields except transformed message.
-    let mut response_obj = ollama_resp
-        .as_object()
-        .cloned()
-        .unwrap_or_else(Map::new);
+    let mut response_obj = ollama_resp.as_object().cloned().unwrap_or_else(Map::new);
     response_obj.remove("message");
 
     // Ensure required OpenAI fields are present.
@@ -657,10 +663,7 @@ fn ollama_to_anthropic_response(
     }
 
     // Preserve all top-level Ollama fields except transformed message.
-    let mut response_obj = ollama_resp
-        .as_object()
-        .cloned()
-        .unwrap_or_else(Map::new);
+    let mut response_obj = ollama_resp.as_object().cloned().unwrap_or_else(Map::new);
     response_obj.remove("message");
 
     // Ensure required Anthropic fields are present.
@@ -775,7 +778,11 @@ async fn call_compaction_model(
     compaction_model: &str,
     combined_text: &str,
 ) -> String {
-    let user_content = format!("{}{}", trash_compactor::COMPACTION_USER_PREFIX, combined_text);
+    let user_content = format!(
+        "{}{}",
+        trash_compactor::COMPACTION_USER_PREFIX,
+        combined_text
+    );
 
     for attempt in 0..2 {
         let request = serde_json::json!({
@@ -811,7 +818,11 @@ async fn call_compaction_model(
                         );
                     }
                     Err(e) => {
-                        eprintln!("Compaction call failed (attempt {}): failed to parse response: {}", attempt + 1, e);
+                        eprintln!(
+                            "Compaction call failed (attempt {}): failed to parse response: {}",
+                            attempt + 1,
+                            e
+                        );
                     }
                 }
             }
@@ -838,11 +849,7 @@ async fn call_compaction_model(
 
 /// Run the full compaction workflow if needed.
 /// This implements the multi-phase context compaction system.
-async fn maybe_compact(
-    state: &AppState,
-    model: &str,
-    messages: &[trash_compactor::Message],
-) {
+async fn maybe_compact(state: &AppState, model: &str, messages: &[trash_compactor::Message]) {
     // Get max context size for this model
     let max_context_size = get_max_context_size(state, model);
 
@@ -1072,7 +1079,15 @@ async fn chat_completions(
 
     if stream {
         // Streaming response: convert Ollama NDJSON to OpenAI SSE format
-        handle_streaming_chat(response, model, id, created, state.compactor.clone(), incoming_messages).await
+        handle_streaming_chat(
+            response,
+            model,
+            id,
+            created,
+            state.compactor.clone(),
+            incoming_messages,
+        )
+        .await
     } else {
         // Non-streaming response
         let response_text = match response.text().await {
@@ -1145,8 +1160,10 @@ async fn chat_completions(
             };
             compactor.process_response_message(&message, &incoming_messages);
             match text_parsed_content {
-                Some(ref remaining) => trash_compactor::TrashCompactor::strip_priority_markers(remaining),
-                None => trash_compactor::TrashCompactor::strip_priority_markers(&raw_content),
+                Some(ref remaining) => {
+                    trash_compactor::TrashCompactor::remove_all_priority_markers(remaining)
+                }
+                None => trash_compactor::TrashCompactor::remove_all_priority_markers(&raw_content),
             }
         };
 
@@ -1185,6 +1202,7 @@ async fn handle_streaming_chat(
         // Buffer to accumulate all content for post-stream processing
         let mut accumulated_content = String::new();
         let mut accumulated_tool_calls: Vec<Value> = Vec::new();
+        let mut emitted_len: usize = 0; // chars of stripped content already sent
 
         // Track if we've emitted the role in the first chunk
         let mut emitted_role = false;
@@ -1233,8 +1251,30 @@ async fn handle_streaming_chat(
                                     .and_then(|d| d.as_bool())
                                     .unwrap_or(false);
 
-                                // Strip priority markers from content for emission
-                                let stripped_content = trash_compactor::TrashCompactor::strip_priority_markers(raw_content);
+                                // Compute stripped content from full accumulation (handles cross-chunk markers)
+                                let stripped_all =
+                                    trash_compactor::TrashCompactor::remove_all_priority_markers(
+                                        &accumulated_content,
+                                    );
+
+                                // Determine how much is safe to emit (hold back partial marker suffixes)
+                                let holdback = if done {
+                                    0 // On final chunk, emit everything remaining
+                                } else {
+                                    trash_compactor::TrashCompactor::partial_marker_suffix_len(
+                                        &accumulated_content,
+                                    )
+                                };
+                                let safe_len = stripped_all.len().saturating_sub(holdback);
+
+                                // Compute the new delta to emit
+                                let delta_content = if safe_len > emitted_len {
+                                    let delta = &stripped_all[emitted_len..safe_len];
+                                    emitted_len = safe_len;
+                                    Some(delta.to_string())
+                                } else {
+                                    None
+                                };
 
                                 // Build the delta for this chunk
                                 let mut delta = serde_json::json!({});
@@ -1245,9 +1285,11 @@ async fn handle_streaming_chat(
                                     emitted_role = true;
                                 }
 
-                                // Include content if there's any (after stripping)
-                                if !stripped_content.is_empty() {
-                                    delta["content"] = Value::String(stripped_content);
+                                // Include content if there's a new delta to emit
+                                if let Some(ref content) = delta_content {
+                                    if !content.is_empty() {
+                                        delta["content"] = Value::String(content.clone());
+                                    }
                                 }
 
                                 // Determine finish_reason — resolve ALL tool calls (structured + text fallback) first
@@ -1281,7 +1323,7 @@ async fn handle_streaming_chat(
                                 // Include tool_calls on the final chunk if present
                                 if has_tool_calls {
                                     delta["tool_calls"] = Value::Array(normalized_tool_calls);
-                                    if raw_content.is_empty() {
+                                    if delta_content.as_ref().map_or(true, |s| s.is_empty()) {
                                         delta["content"] = Value::Null;
                                     }
                                 }
@@ -1325,10 +1367,13 @@ async fn handle_streaming_chat(
                                     // Process the complete accumulated content through TrashCompactor
                                     // This updates internal state but doesn't affect already-streamed output
                                     let mut compactor_guard = compactor.write().await;
-                                    compactor_guard.process_response_message(&trash_compactor::Message {
-                                        role: "assistant".to_string(),
-                                        content: accumulated_content.clone(),
-                                    }, &incoming_messages);
+                                    compactor_guard.process_response_message(
+                                        &trash_compactor::Message {
+                                            role: "assistant".to_string(),
+                                            content: accumulated_content.clone(),
+                                        },
+                                        &incoming_messages,
+                                    );
 
                                     break;
                                 }
@@ -1352,13 +1397,18 @@ async fn handle_streaming_chat(
         // If we never emitted a role but had content, send fallback
         if !emitted_role && !accumulated_content.is_empty() {
             // Process the complete accumulated content through TrashCompactor
-            let stripped_content = trash_compactor::TrashCompactor::strip_priority_markers(&accumulated_content);
-            
+            // Note: Fallback correctly strips from accumulated content (handles split markers)
+            let stripped_content =
+                trash_compactor::TrashCompactor::remove_all_priority_markers(&accumulated_content);
+
             let mut compactor_guard = compactor.write().await;
-            compactor_guard.process_response_message(&trash_compactor::Message {
-                role: "assistant".to_string(),
-                content: accumulated_content.clone(),
-            }, &incoming_messages);
+            compactor_guard.process_response_message(
+                &trash_compactor::Message {
+                    role: "assistant".to_string(),
+                    content: accumulated_content.clone(),
+                },
+                &incoming_messages,
+            );
             drop(compactor_guard);
 
             // Fallback: parse text tool calls if no structured tool calls
@@ -1615,8 +1665,10 @@ async fn messages(
         };
         compactor.process_response_message(&message, &messages);
         match text_parsed_content {
-            Some(ref remaining) => trash_compactor::TrashCompactor::strip_priority_markers(remaining),
-            None => trash_compactor::TrashCompactor::strip_priority_markers(&raw_content),
+            Some(ref remaining) => {
+                trash_compactor::TrashCompactor::remove_all_priority_markers(remaining)
+            }
+            None => trash_compactor::TrashCompactor::remove_all_priority_markers(&raw_content),
         }
     };
 
@@ -1800,21 +1852,36 @@ mod tests {
         );
 
         // Verify tool_calls are present in the response
-        let choices = openai_response.get("choices").and_then(|c| c.as_array()).unwrap();
+        let choices = openai_response
+            .get("choices")
+            .and_then(|c| c.as_array())
+            .unwrap();
         assert_eq!(choices.len(), 1);
-        
+
         let message = &choices[0]["message"];
-        let response_tool_calls = message.get("tool_calls").and_then(|tc| tc.as_array()).unwrap();
+        let response_tool_calls = message
+            .get("tool_calls")
+            .and_then(|tc| tc.as_array())
+            .unwrap();
         assert_eq!(response_tool_calls.len(), 1);
-        
+
         // Verify tool_call structure
         let tool_call = &response_tool_calls[0];
         assert_eq!(tool_call.get("index").and_then(|i| i.as_u64()), Some(0));
-        assert_eq!(tool_call.get("id").and_then(|i| i.as_str()), Some("call_123"));
-        assert_eq!(tool_call.get("type").and_then(|t| t.as_str()), Some("function"));
-        
+        assert_eq!(
+            tool_call.get("id").and_then(|i| i.as_str()),
+            Some("call_123")
+        );
+        assert_eq!(
+            tool_call.get("type").and_then(|t| t.as_str()),
+            Some("function")
+        );
+
         let function = tool_call.get("function").unwrap();
-        assert_eq!(function.get("name").and_then(|n| n.as_str()), Some("get_weather"));
+        assert_eq!(
+            function.get("name").and_then(|n| n.as_str()),
+            Some("get_weather")
+        );
         assert_eq!(
             function.get("arguments").and_then(|a| a.as_str()),
             Some("{\"location\": \"San Francisco\"}")
@@ -1831,7 +1898,9 @@ mod tests {
 
         // Verify extra metadata is preserved
         assert_eq!(
-            openai_response.get("custom_metadata").and_then(|m| m.as_str()),
+            openai_response
+                .get("custom_metadata")
+                .and_then(|m| m.as_str()),
             Some("should_be_preserved")
         );
     }
@@ -1860,7 +1929,10 @@ mod tests {
         assert_eq!(normalized.len(), 2);
 
         assert_eq!(normalized[0].get("index").and_then(|i| i.as_u64()), Some(0));
-        assert_eq!(normalized[0].get("type").and_then(|t| t.as_str()), Some("function"));
+        assert_eq!(
+            normalized[0].get("type").and_then(|t| t.as_str()),
+            Some("function")
+        );
         assert_eq!(
             normalized[0]
                 .get("function")
@@ -2014,7 +2086,10 @@ mod tests {
                 .and_then(|t| t.as_str()),
             Some("abc")
         );
-        assert_eq!(ollama_request.get("custom").and_then(|c| c.as_i64()), Some(42));
+        assert_eq!(
+            ollama_request.get("custom").and_then(|c| c.as_i64()),
+            Some(42)
+        );
         assert!(ollama_request.get("stream").is_none());
     }
 
@@ -2055,7 +2130,8 @@ mod tests {
             Some("preserved_value")
         );
         assert_eq!(
-            openai_response.get("another_field")
+            openai_response
+                .get("another_field")
                 .and_then(|f| f.get("nested").and_then(|n| n.as_str())),
             Some("data")
         );
@@ -2063,7 +2139,10 @@ mod tests {
             openai_response.get("created_at").and_then(|c| c.as_str()),
             Some("2024-01-01T00:00:00Z")
         );
-        assert_eq!(openai_response.get("done").and_then(|d| d.as_bool()), Some(true));
+        assert_eq!(
+            openai_response.get("done").and_then(|d| d.as_bool()),
+            Some(true)
+        );
         assert_eq!(
             openai_response
                 .get("total_duration")
@@ -2072,9 +2151,18 @@ mod tests {
         );
 
         // Verify standard fields are set correctly
-        assert_eq!(openai_response.get("id").and_then(|i| i.as_str()), Some("chatcmpl-test"));
-        assert_eq!(openai_response.get("object").and_then(|o| o.as_str()), Some("chat.completion"));
-        assert_eq!(openai_response.get("model").and_then(|m| m.as_str()), Some("test-model"));
+        assert_eq!(
+            openai_response.get("id").and_then(|i| i.as_str()),
+            Some("chatcmpl-test")
+        );
+        assert_eq!(
+            openai_response.get("object").and_then(|o| o.as_str()),
+            Some("chat.completion")
+        );
+        assert_eq!(
+            openai_response.get("model").and_then(|m| m.as_str()),
+            Some("test-model")
+        );
     }
 
     /// Test Anthropic output passthrough preserves extra fields.
@@ -2092,30 +2180,46 @@ mod tests {
             "custom_anthropic_field": "preserved"
         });
 
-        let anthropic_response = ollama_to_anthropic_response(
-            &ollama_resp,
-            "test-model",
-            "msg_test",
-            "Hello!",
-            None,
-        );
+        let anthropic_response =
+            ollama_to_anthropic_response(&ollama_resp, "test-model", "msg_test", "Hello!", None);
 
         // Verify extra field is preserved
         assert_eq!(
-            anthropic_response.get("custom_anthropic_field").and_then(|f| f.as_str()),
+            anthropic_response
+                .get("custom_anthropic_field")
+                .and_then(|f| f.as_str()),
             Some("preserved")
         );
         assert_eq!(
-            anthropic_response.get("created_at").and_then(|c| c.as_str()),
+            anthropic_response
+                .get("created_at")
+                .and_then(|c| c.as_str()),
             Some("2024-01-01T00:00:00Z")
         );
-        assert_eq!(anthropic_response.get("done").and_then(|d| d.as_bool()), Some(true));
+        assert_eq!(
+            anthropic_response.get("done").and_then(|d| d.as_bool()),
+            Some(true)
+        );
 
         // Verify standard Anthropic fields are set correctly
-        assert_eq!(anthropic_response.get("id").and_then(|i| i.as_str()), Some("msg_test"));
-        assert_eq!(anthropic_response.get("type").and_then(|t| t.as_str()), Some("message"));
-        assert_eq!(anthropic_response.get("role").and_then(|r| r.as_str()), Some("assistant"));
-        assert_eq!(anthropic_response.get("stop_reason").and_then(|s| s.as_str()), Some("end_turn"));
+        assert_eq!(
+            anthropic_response.get("id").and_then(|i| i.as_str()),
+            Some("msg_test")
+        );
+        assert_eq!(
+            anthropic_response.get("type").and_then(|t| t.as_str()),
+            Some("message")
+        );
+        assert_eq!(
+            anthropic_response.get("role").and_then(|r| r.as_str()),
+            Some("assistant")
+        );
+        assert_eq!(
+            anthropic_response
+                .get("stop_reason")
+                .and_then(|s| s.as_str()),
+            Some("end_turn")
+        );
     }
 
     /// Test tool_calls extraction from Ollama response.
@@ -2148,8 +2252,14 @@ mod tests {
         assert_eq!(tool_calls.len(), 2);
 
         // Verify type field is added when missing
-        assert_eq!(tool_calls[0].get("type").and_then(|t| t.as_str()), Some("function"));
-        assert_eq!(tool_calls[1].get("type").and_then(|t| t.as_str()), Some("function"));
+        assert_eq!(
+            tool_calls[0].get("type").and_then(|t| t.as_str()),
+            Some("function")
+        );
+        assert_eq!(
+            tool_calls[1].get("type").and_then(|t| t.as_str()),
+            Some("function")
+        );
 
         // Test with no tool_calls
         let message_without_tools = serde_json::json!({
@@ -2172,7 +2282,10 @@ mod tests {
     fn test_required_model_from_payload() {
         // Valid model
         let valid_payload = serde_json::json!({"model": "test-model"});
-        assert_eq!(required_model_from_payload(&valid_payload), Ok("test-model".to_string()));
+        assert_eq!(
+            required_model_from_payload(&valid_payload),
+            Ok("test-model".to_string())
+        );
 
         // Empty model string
         let empty_model = serde_json::json!({"model": "   "});
@@ -2197,9 +2310,8 @@ mod tests {
         let (calls, remaining) = parse_text_tool_calls(content).unwrap();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0]["function"]["name"].as_str(), Some("glob"));
-        let args: Value = serde_json::from_str(
-            calls[0]["function"]["arguments"].as_str().unwrap()
-        ).unwrap();
+        let args: Value =
+            serde_json::from_str(calls[0]["function"]["arguments"].as_str().unwrap()).unwrap();
         assert_eq!(args["pattern"].as_str(), Some("**"));
         assert!(remaining.is_empty());
     }
@@ -2210,9 +2322,8 @@ mod tests {
         let (calls, remaining) = parse_text_tool_calls(content).unwrap();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0]["function"]["name"].as_str(), Some("read"));
-        let args: Value = serde_json::from_str(
-            calls[0]["function"]["arguments"].as_str().unwrap()
-        ).unwrap();
+        let args: Value =
+            serde_json::from_str(calls[0]["function"]["arguments"].as_str().unwrap()).unwrap();
         assert_eq!(args["filePath"].as_str(), Some("/src/main.rs"));
         assert_eq!(args["offset"].as_str(), Some("100"));
         assert!(remaining.is_empty());
@@ -2274,9 +2385,8 @@ mod tests {
         let (calls, _) = parse_text_tool_calls(content).unwrap();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0]["function"]["name"].as_str(), Some("do_something"));
-        let args: Value = serde_json::from_str(
-            calls[0]["function"]["arguments"].as_str().unwrap()
-        ).unwrap();
+        let args: Value =
+            serde_json::from_str(calls[0]["function"]["arguments"].as_str().unwrap()).unwrap();
         assert!(args.as_object().unwrap().is_empty());
     }
 
@@ -2284,9 +2394,8 @@ mod tests {
     fn test_parse_text_tool_calls_whitespace_in_values() {
         let content = "<function=glob>\n<parameter=pattern>\n  **/*.rs\n</parameter>\n</function>";
         let (calls, _) = parse_text_tool_calls(content).unwrap();
-        let args: Value = serde_json::from_str(
-            calls[0]["function"]["arguments"].as_str().unwrap()
-        ).unwrap();
+        let args: Value =
+            serde_json::from_str(calls[0]["function"]["arguments"].as_str().unwrap()).unwrap();
         assert_eq!(args["pattern"].as_str(), Some("**/*.rs"));
     }
 
@@ -2316,7 +2425,10 @@ mod tests {
             }]
         });
         let structured = extract_ollama_tool_calls(&message);
-        assert!(structured.is_some(), "Structured tool_calls should take precedence");
+        assert!(
+            structured.is_some(),
+            "Structured tool_calls should take precedence"
+        );
     }
 
     // ====================================================================
@@ -2384,7 +2496,10 @@ mod tests {
             "done": true
         });
 
-        let raw_content = ollama_resp["message"]["content"].as_str().unwrap().to_string();
+        let raw_content = ollama_resp["message"]["content"]
+            .as_str()
+            .unwrap()
+            .to_string();
         let (tool_calls, remaining) = parse_text_tool_calls(&raw_content).unwrap();
 
         let anthropic_response = ollama_to_anthropic_response(
@@ -2398,7 +2513,11 @@ mod tests {
         assert_eq!(anthropic_response["stop_reason"].as_str(), Some("tool_use"));
         let content = anthropic_response["content"].as_array().unwrap();
         // Should have text block + tool_use block
-        assert!(content.iter().any(|c| c["type"].as_str() == Some("tool_use")));
+        assert!(
+            content
+                .iter()
+                .any(|c| c["type"].as_str() == Some("tool_use"))
+        );
     }
 
     #[test]
@@ -2412,9 +2531,8 @@ mod tests {
         let (calls, remaining) = parse_text_tool_calls(content).unwrap();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0]["function"]["name"].as_str(), Some("write"));
-        let args: Value = serde_json::from_str(
-            calls[0]["function"]["arguments"].as_str().unwrap()
-        ).unwrap();
+        let args: Value =
+            serde_json::from_str(calls[0]["function"]["arguments"].as_str().unwrap()).unwrap();
         assert_eq!(args["filePath"].as_str(), Some("/src/lib.rs"));
         assert!(args["content"].as_str().unwrap().contains("fn main()"));
         assert!(remaining.is_empty());
@@ -2424,7 +2542,8 @@ mod tests {
     fn test_streaming_text_fallback_finish_reason_on_done_chunk() {
         // Test: text-fallback tool call in streaming done chunk => finish_reason tool_calls
         let accumulated_tool_calls = vec![];
-        let accumulated_content = "<function=glob><parameter=pattern>**/*.rs</parameter></function>";
+        let accumulated_content =
+            "<function=glob><parameter=pattern>**/*.rs</parameter></function>";
 
         // Resolve tool calls BEFORE done-chunk is emitted (new behavior)
         let (resolved_tool_calls, used_text_fallback) =
@@ -2493,7 +2612,8 @@ mod tests {
     fn test_streaming_done_chunk_text_tool_calls_finish_reason_not_stop() {
         // Regression test: text-fallback tool call => finish_reason should be "tool_calls", not "stop"
         let accumulated_tool_calls = vec![];
-        let accumulated_content = "<function=Read><parameter=filePath>/src/lib.rs</parameter></function>";
+        let accumulated_content =
+            "<function=Read><parameter=filePath>/src/lib.rs</parameter></function>";
 
         let (resolved_tool_calls, used_text_fallback) =
             resolve_streaming_tool_calls(&accumulated_tool_calls, accumulated_content);
@@ -2546,7 +2666,8 @@ mod tests {
                 "arguments": "{\"param\": \"value\"}"
             }
         })];
-        let accumulated_content = "<function=text_call><parameter=pattern>**/*.rs</parameter></function>";
+        let accumulated_content =
+            "<function=text_call><parameter=pattern>**/*.rs</parameter></function>";
 
         let (resolved_tool_calls, used_text_fallback) =
             resolve_streaming_tool_calls(&accumulated_tool_calls, accumulated_content);
@@ -2812,5 +2933,66 @@ mod tests {
 
         let args_str = normalized[0]["function"]["arguments"].as_str().unwrap();
         assert_eq!(args_str, r#"{"filePath":"/src/main.rs"}"#);
+    }
+
+    // ====================================================================
+    // Streaming Priority Marker Tests
+    // ====================================================================
+
+    #[test]
+    fn test_streaming_priority_marker_not_leaked_in_sse_chunks() {
+        // Simulate streaming chunks with a split priority marker
+        let chunks = vec!["Hello $$PRIORITY:", "HIGH$$ world"];
+
+        // Simulate the streaming loop algorithm
+        let mut accumulated = String::new();
+        let mut emitted_len = 0usize;
+        let mut output = String::new();
+
+        for (i, chunk) in chunks.iter().enumerate() {
+            accumulated.push_str(chunk);
+            let stripped =
+                trash_compactor::TrashCompactor::remove_all_priority_markers(&accumulated);
+            let is_done = i == chunks.len() - 1;
+            let holdback = if is_done {
+                0
+            } else {
+                trash_compactor::TrashCompactor::partial_marker_suffix_len(&accumulated)
+            };
+            let safe_len = stripped.len().saturating_sub(holdback);
+            if safe_len > emitted_len {
+                output.push_str(&stripped[emitted_len..safe_len]);
+                emitted_len = safe_len;
+            }
+        }
+
+        // Verify no marker leaked into the output
+        assert!(!output.contains("$$PRIORITY"));
+        assert!(!output.contains("HIGH$$"));
+        assert_eq!(output, "Hello  world");
+
+        // Verify SSE-style chunk construction doesn't include markers
+        // (Simulating what would be serialized in the delta)
+        let delta_content = output;
+        let delta = serde_json::json!({
+            "role": "assistant",
+            "content": delta_content
+        });
+
+        let sse_chunk = serde_json::json!({
+            "id": "chatcmpl-test",
+            "object": "chat.completion.chunk",
+            "created": 1234567890u64,
+            "model": "test-model",
+            "choices": [{
+                "index": 0,
+                "delta": delta,
+                "finish_reason": null
+            }]
+        });
+
+        let serialized = serde_json::to_string(&sse_chunk).unwrap();
+        assert!(!serialized.contains("$$PRIORITY"));
+        assert!(!serialized.contains("HIGH$$"));
     }
 }

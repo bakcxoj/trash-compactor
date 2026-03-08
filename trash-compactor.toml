@@ -1,0 +1,22 @@
+# Trash Compactor Configuration
+# Copy this file to trash-compactor.toml and customize
+
+# Ollama backend URL (default: "http://127.0.0.1:11434")
+# ollama_url = "http://127.0.0.1:11434"
+
+# Server listen address (default: "127.0.0.1:11435")
+# listen_addr = "127.0.0.1:11435"
+
+# Model used for compaction summarization calls (REQUIRED for compaction to work)
+# If omitted, compaction is disabled and over-budget contexts pass through with a warning.
+compaction_model = "qwen3:8b"
+
+# Default max context size in TOKENS for all models
+max_context_size = 30000
+
+# Per-model overrides
+# [models."qwen3-coder:30b"]
+# max_context_size = 32768
+
+# [models."llama3:70b"]
+# max_context_size = 8192
